@@ -1,33 +1,35 @@
--- turret.lua  -  one file for all four computers.
+-- turret.lua  -  one file for all computers of the turret.
 --
 -- The guns follow the look direction of the player sitting in a Create seat, with hard angle limits.
 --
---   computer with the seat     :  turret seat   [create_seat_6]
---   computer with the sensor   :  turret sensor [sublevel_sensor_1]
---   computer with horizontal bearing:  turret yaw   [swivel_bearing_2]
---   computer with vertical bearing   :  turret pitch [swivel_bearing_3]
+--   turret control     the CONTROL computer: you type only numbers, it tells the other computers which devices to use
+--   turret seat        computer with the seat
+--   turret sensor      computer with the sensor on the gun structure
+--   turret yaw         computer with the horizontal swivel bearing
+--   turret pitch       computer with the vertical swivel bearing
 --
--- Names in [] are the defaults from CFG below; give a name as the second argument to override it.
 -- Every computer needs a WIRELESS (or ender) modem for rednet, in addition to the modem that sees its peripheral.
--- Autostart: put  shell.run("turret", "yaw")  (or seat / sensor / pitch)  into startup.lua.
+-- Install / update everything with one command (it also sets up startup.lua):
+--   wget run https://raw.githubusercontent.com/Kapebara07/cc-turret/main/install.lua
 --
--- Aligning the horizontal direction (the guns point 180 degrees wrong / sideways at first):
---   * quick way:   turret offset yaw 180      (any number of degrees; 180 = the guns pointed backwards)
---                  turret offset pitch 0
---   * exact way:   press C on the yaw computer; the guns freeze for 10 seconds - walk to the seat, look EXACTLY along
---                  the gun barrels, and when the countdown ends the offset is stored.
--- The sign (which way the bearing has to turn) is detected automatically with a small test movement the first time the
--- sensor and the bearing are both online.
+-- THE CONTROL COMPUTER (`turret control`) - type only the numbers of the devices, for example:
+--   seat 6        -> create_seat_6          sensor 1  -> sublevel_sensor_1
+--   yaw 2         -> swivel_bearing_2       pitch 3   -> swivel_bearing_3
+--   offset yaw 180      turn the horizontal alignment by 180 degrees
+--   calibrate yaw       freeze the guns for 15 s, sit in the seat and look along the barrels, the offset is stored
+--   sign yaw            repeat the "which way does the bearing turn" test
+--   status              which computers are online and what they see
+-- The numbers are sent to all computers by rednet and saved there, so they survive restarts.
+-- Without a control computer the numbers in CFG.defaultNumbers are used (or `turret seat create_seat_6`, a full name
+-- as the second argument always wins).
 --
 -- Limits: the vertical bearing is kept inside CFG.limits.pitch (degrees from the pose it was assembled in). The limit
 -- is enforced every cycle, even when no player sits in the seat or the network is down. The horizontal bearing is
 -- not limited by default (CFG.limits.yaw is empty). The sensor is used to align the guns with the view.
 
 local CFG = {
-  seatName         = "create_seat_6",
-  sensorName       = "sublevel_sensor_1",
-  yawBearingName   = "swivel_bearing_2",
-  pitchBearingName = "swivel_bearing_3",
+  -- device numbers used until the control computer says otherwise
+  defaultNumbers = { seat = 6, sensor = 1, yaw = 2, pitch = 3 },
 
   -- Allowed bearing angle range, degrees from the assembled pose. Leave min/max out for "no limit".
   limits = {
@@ -42,16 +44,28 @@ local CFG = {
   deadband      = 0.3,   -- degrees; smaller errors are ignored
   maxStep       = 45,    -- biggest correction per cycle, degrees
   pulse         = 12,    -- size of the sign-detection test movement, degrees
-  -- Built-in alignment (degrees) used until an offset is stored by `turret offset ...` or the C key.
+  calibrateDelay = 15,   -- seconds between a calibrate request and storing the offset
+  -- Built-in alignment (degrees) used until an offset is stored by `offset ...` or the calibration.
   -- yaw = 180: the guns face the opposite way to the sensor's zero direction, so turn them half a circle.
   defaultOffset = { yaw = 180, pitch = 0 },
-  calibrateDelay = 15,   -- seconds between pressing C and storing the offset
   pitchField    = "pitch", -- which sensor angle is the barrel elevation: "pitch" (or "roll" if the barrels point sideways)
+  statusPeriod  = 1,     -- how often a computer reports its status to the control computer, seconds
+  offlineAfter  = 5,     -- the control computer calls a silent computer offline after this many seconds
 }
 
-local VERSION = "5 (2026-10-05)"
+local VERSION = "6 (2026-10-05)"
 local PROTOCOL = "turret.v1"
 local CAL_FILE = "turret_cal.txt"
+local NET_FILE = "turret_net.txt"
+
+-- peripheral name = prefix .. number
+local PREFIX = {
+  seat   = "create_seat_",
+  sensor = "sublevel_sensor_",
+  yaw    = "swivel_bearing_",
+  pitch  = "swivel_bearing_",
+}
+local ROLE_ORDER = { "seat", "sensor", "yaw", "pitch" }
 
 ------------------------------------------------------------------------------------------------ helpers
 
@@ -65,19 +79,22 @@ end
 
 local function isNumber(v) return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge end
 
-local function loadCal()
-  if not fs.exists(CAL_FILE) then return {} end
-  local f = fs.open(CAL_FILE, "r")
+local function loadFile(name)
+  if not fs.exists(name) then return {} end
+  local f = fs.open(name, "r")
   if not f then return {} end
   local t = textutils.unserialise(f.readAll())
   f.close()
   return type(t) == "table" and t or {}
 end
 
-local function saveCal(t)
-  local f = fs.open(CAL_FILE, "w")
+local function saveFile(name, t)
+  local f = fs.open(name, "w")
   if f then f.write(textutils.serialise(t)) f.close() end
 end
+
+local function loadCal() return loadFile(CAL_FILE) end
+local function saveCal(t) saveFile(CAL_FILE, t) end
 
 local function openRednet()
   local opened = false
@@ -109,71 +126,143 @@ local function status(text)
   term.write(string.sub(text, 1, w))
 end
 
------------------------------------------------------------------------------------------------- seat / sensor
+------------------------------------------------------------------------------------------------ device numbers
 
-local function runSeat(name)
-  local seat, seq = nil, 0
-  while true do
-    -- the named seat first; if it is gone (renumbered / replaced), any seat this computer can see
-    if not seat then seat = peripheral.wrap(name) or peripheral.find("create_seat") end
-    if not seat then
-      status("waiting for seat " .. name)
-    else
-      local yaw, pitch
-      local ok = pcall(parallel.waitForAll,
-        function() yaw = seat.getYaw() end,
-        function() pitch = seat.getPitch() end)
-      if not ok then
-        seat = nil
-      else
-        seq = seq + 1
-        rednet.broadcast({ t = "aim", seq = seq, occ = isNumber(yaw) and isNumber(pitch), yaw = yaw, pitch = pitch }, PROTOCOL)
-        status(isNumber(yaw) and string.format("seat: yaw %.1f pitch %.1f", yaw, pitch) or "seat: empty")
-      end
-    end
-    sleep(CFG.sendPeriod)
-  end
+-- The numbers the control computer sent (saved in NET_FILE); falls back to CFG.defaultNumbers.
+local net = loadFile(NET_FILE)
+
+local function numberFor(role)
+  local n = net[role]
+  if isNumber(n) then return n end
+  return CFG.defaultNumbers[role]
 end
 
-local function runSensor(name)
-  local sensor, seq = nil, 0
-  while true do
-    -- the named sensor first; if it is gone (renumbered / replaced), the only sensor this computer can see
-    if not sensor then
-      sensor = peripheral.wrap(name)
-      if not sensor then
-        local found = { peripheral.find("sublevel_sensor") }
-        if #found == 1 then sensor = found[1] end   -- with several sensors we do not guess
-      end
+-- Full peripheral name of a role. An explicit name (second command line argument) always wins.
+local function deviceName(role, explicit)
+  if explicit then return explicit end
+  return PREFIX[role] .. tostring(numberFor(role))
+end
+
+-- Handles a "config" message from the control computer. Returns true if some number changed.
+local function applyConfig(msg)
+  if type(msg) ~= "table" or msg.t ~= "config" then return false end
+  local changed = false
+  for _, role in ipairs(ROLE_ORDER) do
+    local n = msg[role]
+    if isNumber(n) and n >= 0 and n % 1 == 0 and net[role] ~= n then
+      net[role] = n
+      changed = true
     end
-    if not sensor then
-      status("waiting for sensor " .. name)
-    else
-      local ok, rot = pcall(sensor.getRotation)
-      if not ok then
-        sensor = nil
+  end
+  if changed then saveFile(NET_FILE, net) end
+  return changed
+end
+
+local lastAnnounce = {}
+-- Tell the control computer what this computer is doing (at most once per CFG.statusPeriod).
+local function announce(role, device, ok, note)
+  local now = os.clock()
+  if lastAnnounce[role] and now - lastAnnounce[role] < CFG.statusPeriod then return end
+  lastAnnounce[role] = now
+  rednet.broadcast({ t = "status", role = role, device = device, ok = ok and true or false, note = note }, PROTOCOL)
+end
+
+-- Runs `main` next to a listener that keeps the device numbers up to date.
+local function withConfigListener(main)
+  local function listener()
+    while true do
+      local _, msg = rednet.receive(PROTOCOL)
+      applyConfig(msg)
+    end
+  end
+  return parallel.waitForAny(main, listener)
+end
+
+------------------------------------------------------------------------------------------------ seat / sensor
+
+local function runSeat(explicit)
+  local seat, seatName, seq = nil, nil, 0
+  local function loop()
+    while true do
+      local name = deviceName("seat", explicit)
+      if name ~= seatName then seat, seatName = nil, name end   -- the control computer changed the number
+      -- the named seat first; if it is gone (renumbered / replaced), any seat this computer can see
+      if not seat then seat = peripheral.wrap(name) or peripheral.find("create_seat") end
+      if not seat then
+        status("waiting for seat " .. name)
+        announce("seat", name, false, "device not found")
       else
-        seq = seq + 1
-        if type(rot) == "table" and isNumber(rot.yaw) then
-          rednet.broadcast({ t = "state", seq = seq, ok = true, yaw = rot.yaw, pitch = rot.pitch, roll = rot.roll }, PROTOCOL)
-          status(string.format("sensor: yaw %.1f pitch %.1f roll %.1f", rot.yaw, rot.pitch, rot.roll))
+        local yaw, pitch
+        local ok = pcall(parallel.waitForAll,
+          function() yaw = seat.getYaw() end,
+          function() pitch = seat.getPitch() end)
+        if not ok then
+          seat = nil
         else
-          rednet.broadcast({ t = "state", seq = seq, ok = false }, PROTOCOL)
-          status("sensor: block is not on a structure")
+          seq = seq + 1
+          rednet.broadcast({ t = "aim", seq = seq, occ = isNumber(yaw) and isNumber(pitch), yaw = yaw, pitch = pitch }, PROTOCOL)
+          local text = isNumber(yaw) and string.format("%s: yaw %.1f pitch %.1f", name, yaw, pitch) or (name .. ": empty")
+          status(text)
+          announce("seat", name, true, text)
         end
       end
+      sleep(CFG.sendPeriod)
     end
-    sleep(CFG.sendPeriod)
   end
+  withConfigListener(loop)
+end
+
+local function runSensor(explicit)
+  local sensor, sensorName, seq = nil, nil, 0
+  local function loop()
+    while true do
+      local name = deviceName("sensor", explicit)
+      if name ~= sensorName then sensor, sensorName = nil, name end
+      -- the named sensor first; if it is gone (renumbered / replaced), the only sensor this computer can see
+      if not sensor then
+        sensor = peripheral.wrap(name)
+        if not sensor then
+          local found = { peripheral.find("sublevel_sensor") }
+          if #found == 1 then sensor = found[1] end   -- with several sensors we do not guess
+        end
+      end
+      if not sensor then
+        status("waiting for sensor " .. name)
+        announce("sensor", name, false, "device not found")
+      else
+        local ok, rot = pcall(sensor.getRotation)
+        if not ok then
+          sensor = nil
+        else
+          seq = seq + 1
+          if type(rot) == "table" and isNumber(rot.yaw) then
+            rednet.broadcast({ t = "state", seq = seq, ok = true, yaw = rot.yaw, pitch = rot.pitch, roll = rot.roll }, PROTOCOL)
+            local text = string.format("%s: yaw %.1f pitch %.1f roll %.1f", name, rot.yaw, rot.pitch, rot.roll)
+            status(text)
+            announce("sensor", name, true, text)
+          else
+            rednet.broadcast({ t = "state", seq = seq, ok = false }, PROTOCOL)
+            status(name .. ": block is not on a structure")
+            announce("sensor", name, false, "block is not on a structure")
+          end
+        end
+      end
+      sleep(CFG.sendPeriod)
+    end
+  end
+  withConfigListener(loop)
 end
 
 ------------------------------------------------------------------------------------------------ bearing controller
 
--- Returns a controller object. `axis` is "yaw" or "pitch". All state lives in the object so it can be tested.
+-- Returns a controller object. `axis` is "yaw" or "pitch". `bearingName` is a name or a function returning the
+-- current name (it can change when the control computer sends new numbers). All state lives in the object so it
+-- can be tested.
 local function newAxisController(axis, bearingName, cal)
   local lim = CFG.limits[axis] or {}
+  local nameFn = type(bearingName) == "function" and bearingName or function() return bearingName end
   local c = {
-    axis = axis, name = bearingName, cal = cal,
+    axis = axis, name = nameFn(), cal = cal,
     bearing = nil,
     aim = nil, aimAt = -1e9, state = nil, stateAt = -1e9,
     lastSent = nil, goal = nil, note = "starting",
@@ -186,6 +275,22 @@ local function newAxisController(axis, bearingName, cal)
       c.aim, c.aimAt = msg, c.now()
     elseif msg.t == "state" then
       c.state, c.stateAt = msg, c.now()
+    elseif msg.t == "cmd" and msg.target == axis then
+      c.onCommand(msg)
+    end
+  end
+
+  -- Commands typed on the control computer.
+  function c.onCommand(msg)
+    if msg.cmd == "offset" and isNumber(msg.value) then
+      c.cal[axis .. "Offset"] = msg.value
+      saveCal(c.cal)
+      c.note = "offset set to " .. msg.value
+    elseif msg.cmd == "calibrate" then
+      c.wantCalibrate = true
+    elseif msg.cmd == "sign" then
+      c.cal[axis .. "Sign"] = nil     -- the control loop repeats the sign test
+      saveCal(c.cal)
     end
   end
 
@@ -211,6 +316,8 @@ local function newAxisController(axis, bearingName, cal)
 
   -- bearing access, every call protected; a failure drops the handle so it is re-wrapped next cycle
   local function call(method, ...)
+    local want = nameFn()
+    if want ~= c.name then c.name, c.bearing, c.engaged, c.lastSent = want, nil, false, nil end
     if not c.bearing then c.bearing = peripheral.wrap(c.name) end
     if not c.bearing then return false end
     local ok, v = pcall(c.bearing[method], ...)
@@ -291,7 +398,7 @@ local function newAxisController(axis, bearingName, cal)
     c.note = string.format("aim %.1f  gun %.1f  err %.1f  bearing %.1f -> %.1f", want, have + offset(), err, target, c.goal)
   end
 
-  -- C key: store the offset that makes the current view equal to the current gun direction.
+  -- Store the offset that makes the current view equal to the current gun direction.
   function c.calibrate()
     local want, have = wanted(), measured()
     if want == nil or have == nil then return false, "need a player in the seat and sensor data" end
@@ -335,16 +442,35 @@ local function newAxisController(axis, bearingName, cal)
     return true, "sign detected: " .. c.cal[axis .. "Sign"]
   end
 
+  -- Freeze the guns for a while, then store the offset (the player looks along the barrels meanwhile).
+  function c.runCalibration()
+    c.hold = true
+    for i = CFG.calibrateDelay, 1, -1 do
+      c.note = "CALIBRATION in " .. i .. " s: guns frozen, sit in the seat and look along the barrels"
+      c.step()                         -- keeps the limit watchdog and the status reports alive
+      if c.onTick then c.onTick() end
+      sleep(1)
+    end
+    local ok, text = c.calibrate()
+    c.note = text
+    c.hold = false
+  end
+
   return c
 end
 
-local function runAxis(axis, bearingName)
+local function runAxis(axis, explicit)
   local cal = loadCal()
-  local c = newAxisController(axis, bearingName, cal)
+  local c = newAxisController(axis, function() return deviceName(axis, explicit) end, cal)
+  c.onTick = function()
+    status(axis .. ": " .. tostring(c.note))
+    announce(axis, c.name, c.engaged and true or false, tostring(c.note))
+  end
 
   local function receiver()
     while true do
       local _, msg = rednet.receive(PROTOCOL)
+      applyConfig(msg)
       c.onMessage(msg)
     end
   end
@@ -353,17 +479,9 @@ local function runAxis(axis, bearingName)
     while true do
       local _, ch = os.pullEvent("char")
       if ch == "c" or ch == "C" then
-        c.hold = true            -- freeze the guns so you can see where they really point
-        for i = CFG.calibrateDelay, 1, -1 do
-          c.note = "CALIBRATION in " .. i .. " s: guns frozen, sit in the seat and look along the barrels"
-          sleep(1)
-        end
-        local ok, text = c.calibrate()
-        c.note = text
-        c.hold = false
+        c.wantCalibrate = true
       elseif ch == "s" or ch == "S" then
-        cal[axis .. "Sign"] = nil     -- the control loop repeats the sign test
-        saveCal(cal)
+        c.onCommand({ cmd = "sign" })
       end
     end
   end
@@ -376,6 +494,10 @@ local function runAxis(axis, bearingName)
       if cycles % 10 == 0 then   -- pick up changes made by `turret offset ...`
         for k, v in pairs(loadCal()) do cal[k] = v end
       end
+      if c.wantCalibrate then
+        c.wantCalibrate = false
+        c.runCalibration()
+      end
       if cal[axis .. "Sign"] == nil and c.engaged and c.now() >= nextSignTry then
         local ok, text = c.detectSign(8)
         c.note = text
@@ -383,6 +505,7 @@ local function runAxis(axis, bearingName)
       end
       c.step()
       status(axis .. ": " .. tostring(c.note))
+      announce(axis, c.name, c.engaged and true or false, tostring(c.note))
       sleep(CFG.controlPeriod)
     end
   end
@@ -391,7 +514,7 @@ local function runAxis(axis, bearingName)
   -- Exit (Ctrl+T or error): keep the bearing under computer control and hold it where it is. Giving control back
   -- would let the shaft spin it freely.
   pcall(function()
-    local b = peripheral.wrap(bearingName)
+    local b = peripheral.wrap(c.name)
     local target = b and b.getTargetAngle()
     if isNumber(target) then b.setTargetAngle(clamp(target, CFG.limits[axis].min, CFG.limits[axis].max)) end
   end)
@@ -399,11 +522,122 @@ local function runAxis(axis, bearingName)
   print("\nStopped; the bearing keeps holding its angle.")
 end
 
+------------------------------------------------------------------------------------------------ control computer
+
+-- Turns a typed line into an action. Returns action table, or nil + message.
+--   {kind="config", role=, number=}  {kind="cmd", target=, cmd=, value=}  {kind="status"}  {kind="help"}
+local function parseCommand(line)
+  local words = {}
+  for w in string.gmatch(line or "", "%S+") do words[#words + 1] = w:lower() end
+  local cmd = words[1]
+  if not cmd then return nil end
+  if PREFIX[cmd] then
+    local n = tonumber(words[2])
+    if n == nil or n < 0 or n > 999 or n % 1 ~= 0 then return nil, "usage: " .. cmd .. " <number>   e.g.  " .. cmd .. " 2" end
+    return { kind = "config", role = cmd, number = n }
+  elseif cmd == "offset" then
+    local axis, v = words[2], tonumber(words[3])
+    if (axis ~= "yaw" and axis ~= "pitch") or v == nil then return nil, "usage: offset yaw|pitch <degrees>   e.g.  offset yaw 180" end
+    return { kind = "cmd", target = axis, cmd = "offset", value = v }
+  elseif cmd == "calibrate" or cmd == "sign" then
+    local axis = words[2]
+    if axis ~= "yaw" and axis ~= "pitch" then return nil, "usage: " .. cmd .. " yaw|pitch" end
+    return { kind = "cmd", target = axis, cmd = cmd }
+  elseif cmd == "status" or cmd == "s" then
+    return { kind = "status" }
+  elseif cmd == "help" or cmd == "?" then
+    return { kind = "help" }
+  end
+  return nil, "unknown command '" .. cmd .. "' - type help"
+end
+
+local function runControl()
+  local seen = {}                       -- role -> { at=, device=, ok=, note= }
+  local netRev = 0
+
+  local function configMessage()
+    local m = { t = "config", rev = netRev }
+    for _, role in ipairs(ROLE_ORDER) do m[role] = numberFor(role) end
+    return m
+  end
+
+  local function showStatus()
+    print("")
+    for _, role in ipairs(ROLE_ORDER) do
+      local want = deviceName(role)
+      local s = seen[role]
+      local state
+      if s and os.clock() - s.at <= CFG.offlineAfter then
+        state = (s.ok and "ok      " or "PROBLEM ")
+      elseif s then
+        state = "offline "
+      else
+        state = "no signal"
+      end
+      print(string.format("%-6s %-20s %s", role, want, state))
+      if s and os.clock() - s.at <= CFG.offlineAfter and s.note then print("       " .. string.sub(tostring(s.note), 1, 44)) end
+    end
+  end
+
+  local function help()
+    print("")
+    print("seat <n>  sensor <n>  yaw <n>  pitch <n>   device numbers")
+    print("offset yaw|pitch <deg>   alignment, e.g. offset yaw 180")
+    print("calibrate yaw|pitch      freeze, look along barrels, store")
+    print("sign yaw|pitch           repeat the bearing direction test")
+    print("status                   who is online, what they see")
+  end
+
+  local function listener()
+    while true do
+      local _, msg = rednet.receive(PROTOCOL)
+      if type(msg) == "table" and msg.t == "status" and PREFIX[msg.role or ""] then
+        seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note }
+      end
+    end
+  end
+
+  local function broadcaster()
+    while true do
+      rednet.broadcast(configMessage(), PROTOCOL)
+      sleep(3)
+    end
+  end
+
+  local function input()
+    help()
+    while true do
+      write("\n> ")
+      local line = read()
+      local action, problem = parseCommand(line)
+      if action == nil then
+        if problem then print(problem) end
+      elseif action.kind == "config" then
+        net[action.role] = action.number
+        saveFile(NET_FILE, net)
+        netRev = netRev + 1
+        rednet.broadcast(configMessage(), PROTOCOL)
+        print(action.role .. " -> " .. deviceName(action.role) .. "   (sent to all computers)")
+      elseif action.kind == "cmd" then
+        rednet.broadcast({ t = "cmd", target = action.target, cmd = action.cmd, value = action.value }, PROTOCOL)
+        print("sent to the " .. action.target .. " computer: " .. action.cmd .. (action.value and (" " .. action.value) or ""))
+      elseif action.kind == "status" then
+        showStatus()
+      elseif action.kind == "help" then
+        help()
+      end
+    end
+  end
+
+  local ok, err = pcall(parallel.waitForAny, listener, broadcaster, input)
+  if not ok and err ~= "Terminated" then error(err, 0) end
+end
+
 ------------------------------------------------------------------------------------------------ main
 
 local M = { wrap180 = wrap180, clamp = clamp, newAxisController = newAxisController, CFG = CFG,
-  runSeat = runSeat, runSensor = runSensor, runAxis = runAxis }
-M.main = nil   -- filled in below
+  runSeat = runSeat, runSensor = runSensor, runAxis = runAxis, runControl = runControl,
+  deviceName = deviceName, applyConfig = applyConfig, parseCommand = parseCommand, net = net, VERSION = VERSION }
 
 local function main(...)
   local args = { ... }
@@ -420,25 +654,29 @@ local function main(...)
     print(axis .. " offset set to " .. value .. " (a running turret picks it up within a second)")
     return
   end
-  if role ~= "seat" and role ~= "sensor" and role ~= "yaw" and role ~= "pitch" then
-    print("usage: turret seat|sensor|yaw|pitch [peripheral name]   or   turret offset yaw|pitch <degrees>")
+  if role ~= "seat" and role ~= "sensor" and role ~= "yaw" and role ~= "pitch" and role ~= "control" then
+    print("usage: turret control | seat | sensor | yaw | pitch  [full peripheral name]")
     return
   end
   if not openRednet() then error("No modem found: attach a wireless (or ender) modem", 0) end
   term.clear()
   term.setCursorPos(1, 1)
-  local shown = args[2] or (role == "seat" and CFG.seatName) or (role == "sensor" and CFG.sensorName)
-    or (role == "yaw" and CFG.yawBearingName) or CFG.pitchBearingName
+  if role == "control" then
+    print("turret v" .. VERSION .. "  CONTROL computer")
+    runControl()
+    return
+  end
+  local shown = deviceName(role, args[2])
   print("turret v" .. VERSION .. "  role: " .. role .. "  device: " .. shown)
-  print("(Ctrl+T to stop)")
+  print("(Ctrl+T to stop; numbers and commands come from the control computer)")
   if role == "yaw" or role == "pitch" then print("C = calibrate in " .. CFG.calibrateDelay .. " s (look along the barrels), S = redo sign test") end
   print("")
   local _, row = term.getCursorPos()
   statusRow = row
-  if role == "seat" then runSeat(args[2] or CFG.seatName)
-  elseif role == "sensor" then runSensor(args[2] or CFG.sensorName)
-  elseif role == "yaw" then runAxis("yaw", args[2] or CFG.yawBearingName)
-  else runAxis("pitch", args[2] or CFG.pitchBearingName) end
+  if role == "seat" then runSeat(args[2])
+  elseif role == "sensor" then runSensor(args[2])
+  elseif role == "yaw" then runAxis("yaw", args[2])
+  else runAxis("pitch", args[2]) end
 end
 
 M.main = main
