@@ -52,7 +52,7 @@ local CFG = {
   offlineAfter  = 5,     -- the control computer calls a silent computer offline after this many seconds
 }
 
-local VERSION = "8 (2026-10-05)"
+local VERSION = "9 (2026-10-05)"
 local PROTOCOL = "turret.v1"
 local CAL_FILE = "turret_cal.txt"
 local NET_FILE = "turret_net.txt"
@@ -142,9 +142,21 @@ local function deviceName(role, explicit)
   return PREFIX[role] .. tostring(numberFor(role))
 end
 
--- Handles a "config" message from the control computer. Returns true if some number changed.
-local function applyConfig(msg)
+-- Who sent the numbers this computer is using (only for diagnostics).
+local numbersFrom = nil
+local function numbersTag()
+  return numbersFrom and (" (numbers from computer #" .. numbersFrom .. ")") or " (built-in default numbers)"
+end
+
+-- Handles a "config" message from a control computer. Returns true if something changed.
+-- Every edit carries a time stamp: the newest settings win, so an older control computer that is still running
+-- somewhere can never override what you typed last (it used to flip the numbers back every few seconds).
+local function applyConfig(msg, sender)
   if type(msg) ~= "table" or msg.t ~= "config" then return false end
+  local stamp = isNumber(msg.stamp) and msg.stamp or 0
+  local mine = isNumber(net.stamp) and net.stamp or 0
+  if stamp < mine then return false end                 -- older settings: ignore
+  if stamp == mine and mine ~= 0 then return false end  -- the same settings we already have
   local changed = false
   for _, role in ipairs(ROLE_ORDER) do
     local n = msg[role]
@@ -153,7 +165,11 @@ local function applyConfig(msg)
       changed = true
     end
   end
-  if changed then saveFile(NET_FILE, net) end
+  if stamp > mine then net.stamp = stamp changed = true end
+  if changed then
+    saveFile(NET_FILE, net)
+    numbersFrom = sender
+  end
   return changed
 end
 
@@ -172,8 +188,8 @@ end
 local function withConfigListener(main)
   local function listener()
     while true do
-      local _, msg = rednet.receive(PROTOCOL)
-      applyConfig(msg)
+      local sender, msg = rednet.receive(PROTOCOL)
+      applyConfig(msg, sender)
     end
   end
   return parallel.waitForAny(main, listener)
@@ -190,8 +206,8 @@ local function runSeat(explicit)
       -- the named seat first; if it is gone (renumbered / replaced), any seat this computer can see
       if not seat then seat = peripheral.wrap(name) or peripheral.find("create_seat") end
       if not seat then
-        status("waiting for seat " .. name)
-        announce("seat", name, false, "device not found")
+        status("waiting for seat " .. name .. numbersTag())
+        announce("seat", name, false, "device not found" .. numbersTag())
       else
         local yaw, pitch
         local ok = pcall(parallel.waitForAll,
@@ -228,8 +244,8 @@ local function runSensor(explicit)
         end
       end
       if not sensor then
-        status("waiting for sensor " .. name)
-        announce("sensor", name, false, "device not found")
+        status("waiting for sensor " .. name .. numbersTag())
+        announce("sensor", name, false, "device not found" .. numbersTag())
       else
         local ok, rot = pcall(sensor.getRotation)
         if not ok then
@@ -364,7 +380,7 @@ local function newAxisController(axis, bearingName, cal)
   -- One control cycle. Never raises.
   function c.step()
     if not c.engaged then
-      if not c.engage() then c.note = "waiting for bearing " .. c.name return end
+      if not c.engage() then c.note = "waiting for bearing " .. c.name .. numbersTag() return end
     end
     local okT, target = call("getTargetAngle")
     if not (okT and isNumber(target)) then c.engaged = false c.note = "bearing lost" return end
@@ -485,8 +501,8 @@ local function runAxis(axis, explicit)
 
   local function receiver()
     while true do
-      local _, msg = rednet.receive(PROTOCOL)
-      applyConfig(msg)
+      local sender, msg = rednet.receive(PROTOCOL)
+      applyConfig(msg, sender)
       c.onMessage(msg)
     end
   end
@@ -679,6 +695,12 @@ local function newPanel(deps)
       y = y + 1
     end
     if os.clock() - p.msgAt <= 8 then line(y + 1, p.msg, p.msgBad and colors.red or colors.lime) end
+    local warning = deps.conflict and deps.conflict()
+    if warning then line(y + 2, warning, colors.orange) end
+    local rowNow = ROWS[p.sel]
+    local selRole = axisOfRow(rowNow) or rowNow.role
+    local sn = selRole and deps.seen(selRole)
+    if sn and sn.note then line(y + 3, string.sub(selRole .. ": " .. tostring(sn.note), 1, w), colors.gray) end
     line(h - 3, "Up/Down: row   0-9: type   Enter: send", colors.gray)
     line(h - 2, "C: calibrate   S: direction test   I: mirror", colors.gray)
     line(h - 1, "Yaw offset 180 = guns were pointing backwards", colors.gray)
@@ -693,18 +715,37 @@ local function runControl()
   local seen = {}                       -- role -> { at=, device=, ok=, note=, offset=, sign= }
   local netRev = 0
 
+  local conflict = nil                  -- another control computer sends different numbers
+  local adopted = nil                   -- we took newer numbers from another control computer
+
   local function configMessage()
-    local m = { t = "config", rev = netRev }
+    local m = { t = "config", rev = netRev, stamp = net.stamp or 0 }
     for _, role in ipairs(ROLE_ORDER) do m[role] = numberFor(role) end
     return m
   end
 
+  local function sameNumbers(msg)
+    for _, role in ipairs(ROLE_ORDER) do
+      if isNumber(msg[role]) and msg[role] ~= numberFor(role) then return false end
+    end
+    return true
+  end
+
   local panel = newPanel({
+    conflict = function()
+      if conflict and os.clock() - conflict.at <= 10 then
+        return "! computer #" .. tostring(conflict.id) .. " also sends numbers (older/different) - turn it off"
+      end
+      if adopted and os.clock() - adopted.at <= 10 then
+        return "numbers taken from newer control computer #" .. tostring(adopted.id)
+      end
+    end,
     number = numberFor,
     deviceName = function(role) return deviceName(role) end,
     seen = function(role) return seen[role] end,
     setNumber = function(role, n)
       net[role] = n
+      net.stamp = (os.epoch and os.epoch("utc")) or math.floor(os.clock() * 1000)
       saveFile(NET_FILE, net)
       netRev = netRev + 1
       rednet.broadcast(configMessage(), PROTOCOL)
@@ -717,14 +758,25 @@ local function runControl()
 
   local function listener()
     while true do
-      local _, msg = rednet.receive(PROTOCOL)
+      local sender, msg = rednet.receive(PROTOCOL)
       if type(msg) == "table" and msg.t == "status" and PREFIX[msg.role or ""] then
         seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note, offset = msg.offset, sign = msg.sign, invert = msg.invert }
+      elseif type(msg) == "table" and msg.t == "config" then
+        if isNumber(msg.stamp) and msg.stamp > 0 and applyConfig(msg, sender) then
+          adopted = { id = sender, at = os.clock() }     -- it had newer settings: we follow it
+        elseif not sameNumbers(msg) then
+          conflict = { id = sender, at = os.clock() }
+        end
       end
     end
   end
 
   local function broadcaster()
+    sleep(4)    -- the listener adopts newer settings of another control computer first
+    if not isNumber(net.stamp) or net.stamp <= 0 then
+      net.stamp = (os.epoch and os.epoch("utc")) or math.floor(os.clock() * 1000)
+      saveFile(NET_FILE, net)
+    end
     while true do
       rednet.broadcast(configMessage(), PROTOCOL)
       sleep(3)

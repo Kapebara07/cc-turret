@@ -17,7 +17,7 @@ Every computer needs a wireless (or ender) modem for rednet.
 Put one computer with role `control` anywhere in wireless range. It shows a small form (51x19 terminal, works in colour):
 
 ```
-TURRET CONTROL  v8
+TURRET CONTROL  v9
   Device       Number  Name               State
 > Seat         [6    ] create_seat_6      online
   Sensor       [1    ] sublevel_sensor_1  online
@@ -35,6 +35,10 @@ TURRET CONTROL  v8
 - **S** repeats the "which way does the bearing turn" test of the selected axis.
 - **I** is the **mirror switch** of the selected axis: if the guns move opposite to your head (you look up, they go down), press it. It works for both the vertical and the horizontal axis; the offset rows show `mirror ON` / `mirror off`.
 - The **State** column: `online`, `PROBLEM` (the computer cannot find its device / bearing), `OFFLINE` or `NO SIGNAL`.
+
+**Several control computers:** every edit carries a time stamp and the newest settings win everywhere, so an old control computer that
+is still running can no longer flip the numbers back. If one is found, the panel shows an orange warning with its computer id.
+A device that cannot find its peripheral says where its numbers came from (`numbers from computer #N`) - see the note line under the form.
 
 Without a control computer the numbers in `CFG.defaultNumbers` (top of `turret.lua`) are used. A full name given on the
 command line (`turret seat create_seat_9`) always wins.
