@@ -3,7 +3,7 @@
 -- The guns follow the look direction of the player sitting in a Create seat, with hard angle limits.
 --
 --   computer with the seat     :  turret seat   [create_seat_6]
---   computer with the sensor   :  turret sensor [sublevel_sensor_0]
+--   computer with the sensor   :  turret sensor [sublevel_sensor_1]
 --   computer with horizontal bearing:  turret yaw   [swivel_bearing_2]
 --   computer with vertical bearing   :  turret pitch [swivel_bearing_3]
 --
@@ -25,7 +25,7 @@
 
 local CFG = {
   seatName         = "create_seat_6",
-  sensorName       = "sublevel_sensor_0",
+  sensorName       = "sublevel_sensor_1",
   yawBearingName   = "swivel_bearing_2",
   pitchBearingName = "swivel_bearing_3",
 
@@ -137,7 +137,14 @@ end
 local function runSensor(name)
   local sensor, seq = nil, 0
   while true do
-    if not sensor then sensor = peripheral.wrap(name) end
+    -- the named sensor first; if it is gone (renumbered / replaced), the only sensor this computer can see
+    if not sensor then
+      sensor = peripheral.wrap(name)
+      if not sensor then
+        local found = { peripheral.find("sublevel_sensor") }
+        if #found == 1 then sensor = found[1] end   -- with several sensors we do not guess
+      end
+    end
     if not sensor then
       status("waiting for sensor " .. name)
     else
