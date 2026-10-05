@@ -2,7 +2,7 @@
 --
 -- The guns follow the look direction of the player sitting in a Create seat, with hard angle limits.
 --
---   turret control     the CONTROL computer: you type only numbers, it tells the other computers which devices to use
+--   turret control     the CONTROL computer: a form where you type only numbers; it tells the other computers which devices to use
 --   turret seat        computer with the seat
 --   turret sensor      computer with the sensor on the gun structure
 --   turret yaw         computer with the horizontal swivel bearing
@@ -12,14 +12,12 @@
 -- Install / update everything with one command (it also sets up startup.lua):
 --   wget run https://raw.githubusercontent.com/Kapebara07/cc-turret/main/install.lua
 --
--- THE CONTROL COMPUTER (`turret control`) - type only the numbers of the devices, for example:
---   seat 6        -> create_seat_6          sensor 1  -> sublevel_sensor_1
---   yaw 2         -> swivel_bearing_2       pitch 3   -> swivel_bearing_3
---   offset yaw 180      turn the horizontal alignment by 180 degrees
---   calibrate yaw       freeze the guns for 15 s, sit in the seat and look along the barrels, the offset is stored
---   sign yaw            repeat the "which way does the bearing turn" test
---   status              which computers are online and what they see
--- The numbers are sent to all computers by rednet and saved there, so they survive restarts.
+-- THE CONTROL COMPUTER (`turret control`) shows a small form:
+--   Seat / Sensor / Yaw / Pitch rows: type only the NUMBER (6 -> create_seat_6), Enter sends it to all computers
+--   Yaw offset / Pitch offset rows: alignment in degrees (yaw offset 180 = the guns were pointing backwards)
+--   C = calibrate the selected axis (guns freeze for 15 s, sit in the seat and look along the barrels)
+--   S = repeat the "which way does the bearing turn" test of the selected axis
+-- The state column shows which computers are online. The numbers are saved on every computer, so they survive restarts.
 -- Without a control computer the numbers in CFG.defaultNumbers are used (or `turret seat create_seat_6`, a full name
 -- as the second argument always wins).
 --
@@ -53,7 +51,7 @@ local CFG = {
   offlineAfter  = 5,     -- the control computer calls a silent computer offline after this many seconds
 }
 
-local VERSION = "6 (2026-10-05)"
+local VERSION = "7 (2026-10-05)"
 local PROTOCOL = "turret.v1"
 local CAL_FILE = "turret_cal.txt"
 local NET_FILE = "turret_net.txt"
@@ -160,11 +158,13 @@ end
 
 local lastAnnounce = {}
 -- Tell the control computer what this computer is doing (at most once per CFG.statusPeriod).
-local function announce(role, device, ok, note)
+local function announce(role, device, ok, note, extra)
   local now = os.clock()
   if lastAnnounce[role] and now - lastAnnounce[role] < CFG.statusPeriod then return end
   lastAnnounce[role] = now
-  rednet.broadcast({ t = "status", role = role, device = device, ok = ok and true or false, note = note }, PROTOCOL)
+  local m = { t = "status", role = role, device = device, ok = ok and true or false, note = note }
+  if extra then for k, v in pairs(extra) do m[k] = v end end
+  rednet.broadcast(m, PROTOCOL)
 end
 
 -- Runs `main` next to a listener that keeps the device numbers up to date.
@@ -313,6 +313,7 @@ local function newAxisController(axis, bearingName, cal)
 
   local function offset() return c.cal[axis .. "Offset"] or (CFG.defaultOffset or {})[axis] or 0 end
   local function sign() return c.cal[axis .. "Sign"] or 1 end
+  c.getOffset, c.getSign = offset, sign
 
   -- bearing access, every call protected; a failure drops the handle so it is re-wrapped next cycle
   local function call(method, ...)
@@ -464,7 +465,7 @@ local function runAxis(axis, explicit)
   local c = newAxisController(axis, function() return deviceName(axis, explicit) end, cal)
   c.onTick = function()
     status(axis .. ": " .. tostring(c.note))
-    announce(axis, c.name, c.engaged and true or false, tostring(c.note))
+    announce(axis, c.name, c.engaged and true or false, tostring(c.note), { offset = c.getOffset(), sign = c.getSign() })
   end
 
   local function receiver()
@@ -505,7 +506,7 @@ local function runAxis(axis, explicit)
       end
       c.step()
       status(axis .. ": " .. tostring(c.note))
-      announce(axis, c.name, c.engaged and true or false, tostring(c.note))
+      announce(axis, c.name, c.engaged and true or false, tostring(c.note), { offset = c.getOffset(), sign = c.getSign() })
       sleep(CFG.controlPeriod)
     end
   end
@@ -524,35 +525,148 @@ end
 
 ------------------------------------------------------------------------------------------------ control computer
 
--- Turns a typed line into an action. Returns action table, or nil + message.
---   {kind="config", role=, number=}  {kind="cmd", target=, cmd=, value=}  {kind="status"}  {kind="help"}
-local function parseCommand(line)
-  local words = {}
-  for w in string.gmatch(line or "", "%S+") do words[#words + 1] = w:lower() end
-  local cmd = words[1]
-  if not cmd then return nil end
-  if PREFIX[cmd] then
-    local n = tonumber(words[2])
-    if n == nil or n < 0 or n > 999 or n % 1 ~= 0 then return nil, "usage: " .. cmd .. " <number>   e.g.  " .. cmd .. " 2" end
-    return { kind = "config", role = cmd, number = n }
-  elseif cmd == "offset" then
-    local axis, v = words[2], tonumber(words[3])
-    if (axis ~= "yaw" and axis ~= "pitch") or v == nil then return nil, "usage: offset yaw|pitch <degrees>   e.g.  offset yaw 180" end
-    return { kind = "cmd", target = axis, cmd = "offset", value = v }
-  elseif cmd == "calibrate" or cmd == "sign" then
-    local axis = words[2]
-    if axis ~= "yaw" and axis ~= "pitch" then return nil, "usage: " .. cmd .. " yaw|pitch" end
-    return { kind = "cmd", target = axis, cmd = cmd }
-  elseif cmd == "status" or cmd == "s" then
-    return { kind = "status" }
-  elseif cmd == "help" or cmd == "?" then
-    return { kind = "help" }
+-- The control panel: a small form. Pure logic + drawing through `term`, so it can be tested.
+--   up/down (or Tab) select a row, digits type a value, Enter sends it, Backspace erases,
+--   C = calibrate the selected axis, S = repeat its direction test.
+local function newPanel(deps)
+  local ROWS = {
+    { kind = "num", role = "seat",   label = "Seat" },
+    { kind = "num", role = "sensor", label = "Sensor" },
+    { kind = "num", role = "yaw",    label = "Yaw horiz" },
+    { kind = "num", role = "pitch",  label = "Pitch vert" },
+    { kind = "off", axis = "yaw",    label = "Yaw offset" },
+    { kind = "off", axis = "pitch",  label = "Pitch offs." },
+  }
+  local p = { sel = 1, buf = "", msg = "", msgAt = -1e9, msgBad = false }
+
+  local function say(text, bad)
+    p.msg, p.msgBad, p.msgAt = text, bad and true or false, os.clock()
   end
-  return nil, "unknown command '" .. cmd .. "' - type help"
+
+  local function axisOfRow(row)
+    return row.axis or ((row.role == "yaw" or row.role == "pitch") and row.role or nil)
+  end
+
+  local function allowedChar(row, ch)
+    if ch:match("^%d$") then return true end
+    if row.kind == "off" and (ch == "-" or ch == ".") then return true end
+    return false
+  end
+
+  local function maxLen(row) return row.kind == "num" and 3 or 7 end
+
+  local function select(i)
+    p.sel = ((i - 1) % #ROWS) + 1
+    p.buf = ""
+  end
+
+  local function enter()
+    local row = ROWS[p.sel]
+    if p.buf == "" then
+      if row.kind == "num" then deps.resend() say("numbers sent to all computers again") end
+      return
+    end
+    local v = tonumber(p.buf)
+    if v == nil then say("'" .. p.buf .. "' is not a number", true) p.buf = "" return end
+    if row.kind == "num" then
+      if v < 0 or v > 999 or v % 1 ~= 0 then say("device number must be a whole number 0-999", true) p.buf = "" return end
+      deps.setNumber(row.role, v)
+      say(row.role .. " -> " .. deps.deviceName(row.role) .. "   (sent)")
+    else
+      deps.sendCmd(row.axis, "offset", v)
+      say(row.axis .. " offset " .. v .. " (sent)")
+    end
+    p.buf = ""
+  end
+
+  function p.event(ev, a)
+    local row = ROWS[p.sel]
+    if ev == "key" then
+      if a == keys.up then select(p.sel - 1)
+      elseif a == keys.down or a == keys.tab then select(p.sel + 1)
+      elseif a == keys.enter or a == keys.numPadEnter then enter()
+      elseif a == keys.backspace then p.buf = p.buf:sub(1, -2)
+      elseif a == keys.delete then p.buf = "" end
+    elseif ev == "char" and type(a) == "string" then
+      local ch = a:lower()
+      if allowedChar(row, ch) then
+        if #p.buf < maxLen(row) then p.buf = p.buf .. ch end
+      elseif ch == "c" or ch == "s" then
+        local axis = axisOfRow(row)
+        if not axis then say("select a Yaw or Pitch row first", true) return end
+        if ch == "c" then
+          deps.sendCmd(axis, "calibrate")
+          say(axis .. ": guns freeze " .. CFG.calibrateDelay .. " s - sit in the seat and look along the barrels")
+        else
+          deps.sendCmd(axis, "sign")
+          say(axis .. ": direction test started")
+        end
+      end
+    end
+  end
+
+  -- text + colour of the state column for a role
+  local function stateOf(role)
+    local s = deps.seen(role)
+    if not s then return "NO SIGNAL", colors.red end
+    if os.clock() - s.at > CFG.offlineAfter then return "OFFLINE", colors.red end
+    if s.ok then return "online", colors.lime end
+    return "PROBLEM", colors.orange
+  end
+
+  function p.draw()
+    local w, h = term.getSize()
+    local color = term.isColor and term.isColor()
+    local function paint(c) if color and c then term.setTextColor(c) end end
+    local function line(y, text, c)
+      term.setCursorPos(1, y)
+      term.clearLine()
+      paint(c or colors.white)
+      term.write(string.sub(text, 1, w))
+    end
+    term.setBackgroundColor(colors.black)
+    term.clear()
+    line(1, "TURRET CONTROL  v" .. VERSION, colors.yellow)
+    line(3, "  Device       Number  Name               State", colors.lightGray)
+    local y = 4
+    for i, row in ipairs(ROWS) do
+      if row.kind == "off" and y == 8 then y = y + 1 end
+      local selected = (i == p.sel)
+      local shown
+      if selected and p.buf ~= "" then shown = p.buf
+      elseif row.kind == "num" then shown = tostring(deps.number(row.role))
+      else
+        local s = deps.seen(row.axis)
+        shown = (s and s.offset ~= nil) and string.format("%g", math.floor(s.offset * 100 + 0.5) / 100) or "?"
+      end
+      local text = string.format("%s %-12s [%-5s]", selected and ">" or " ", row.label, shown)
+      if row.kind == "num" then
+        local st, stc = stateOf(row.role)
+        term.setCursorPos(1, y)
+        term.clearLine()
+        paint(selected and colors.white or colors.lightGray)
+        term.write(text)
+        term.write(string.format(" %-18s", deps.deviceName(row.role)))
+        paint(stc)
+        term.write(st)
+      else
+        line(y, text .. ((selected and p.buf ~= "") and "  Enter = send" or "  degrees"), selected and colors.white or colors.lightGray)
+      end
+      y = y + 1
+    end
+    if os.clock() - p.msgAt <= 8 then line(y + 1, p.msg, p.msgBad and colors.red or colors.lime) end
+    line(h - 3, "Up/Down: row   0-9: type   Enter: send", colors.gray)
+    line(h - 2, "Backspace: erase   C: calibrate   S: direction test", colors.gray)
+    line(h - 1, "Yaw offset 180 = guns were pointing backwards", colors.gray)
+    paint(colors.white)
+  end
+
+  p.rows = ROWS
+  return p
 end
 
 local function runControl()
-  local seen = {}                       -- role -> { at=, device=, ok=, note= }
+  local seen = {}                       -- role -> { at=, device=, ok=, note=, offset=, sign= }
   local netRev = 0
 
   local function configMessage()
@@ -561,38 +675,27 @@ local function runControl()
     return m
   end
 
-  local function showStatus()
-    print("")
-    for _, role in ipairs(ROLE_ORDER) do
-      local want = deviceName(role)
-      local s = seen[role]
-      local state
-      if s and os.clock() - s.at <= CFG.offlineAfter then
-        state = (s.ok and "ok      " or "PROBLEM ")
-      elseif s then
-        state = "offline "
-      else
-        state = "no signal"
-      end
-      print(string.format("%-6s %-20s %s", role, want, state))
-      if s and os.clock() - s.at <= CFG.offlineAfter and s.note then print("       " .. string.sub(tostring(s.note), 1, 44)) end
-    end
-  end
-
-  local function help()
-    print("")
-    print("seat <n>  sensor <n>  yaw <n>  pitch <n>   device numbers")
-    print("offset yaw|pitch <deg>   alignment, e.g. offset yaw 180")
-    print("calibrate yaw|pitch      freeze, look along barrels, store")
-    print("sign yaw|pitch           repeat the bearing direction test")
-    print("status                   who is online, what they see")
-  end
+  local panel = newPanel({
+    number = numberFor,
+    deviceName = function(role) return deviceName(role) end,
+    seen = function(role) return seen[role] end,
+    setNumber = function(role, n)
+      net[role] = n
+      saveFile(NET_FILE, net)
+      netRev = netRev + 1
+      rednet.broadcast(configMessage(), PROTOCOL)
+    end,
+    resend = function() rednet.broadcast(configMessage(), PROTOCOL) end,
+    sendCmd = function(axis, cmd, value)
+      rednet.broadcast({ t = "cmd", target = axis, cmd = cmd, value = value }, PROTOCOL)
+    end,
+  })
 
   local function listener()
     while true do
       local _, msg = rednet.receive(PROTOCOL)
       if type(msg) == "table" and msg.t == "status" and PREFIX[msg.role or ""] then
-        seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note }
+        seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note, offset = msg.offset, sign = msg.sign }
       end
     end
   end
@@ -604,32 +707,30 @@ local function runControl()
     end
   end
 
-  local function input()
-    help()
+  local function ui()
+    panel.draw()
+    local timer = os.startTimer(0.5)
     while true do
-      write("\n> ")
-      local line = read()
-      local action, problem = parseCommand(line)
-      if action == nil then
-        if problem then print(problem) end
-      elseif action.kind == "config" then
-        net[action.role] = action.number
-        saveFile(NET_FILE, net)
-        netRev = netRev + 1
-        rednet.broadcast(configMessage(), PROTOCOL)
-        print(action.role .. " -> " .. deviceName(action.role) .. "   (sent to all computers)")
-      elseif action.kind == "cmd" then
-        rednet.broadcast({ t = "cmd", target = action.target, cmd = action.cmd, value = action.value }, PROTOCOL)
-        print("sent to the " .. action.target .. " computer: " .. action.cmd .. (action.value and (" " .. action.value) or ""))
-      elseif action.kind == "status" then
-        showStatus()
-      elseif action.kind == "help" then
-        help()
+      local ev, a = os.pullEvent()
+      if ev == "timer" then
+        if a == timer then
+          timer = os.startTimer(0.5)
+          panel.draw()
+        end
+      elseif ev == "key" or ev == "char" then
+        panel.event(ev, a)
+        panel.draw()
+      elseif ev == "term_resize" then
+        panel.draw()
       end
     end
   end
 
-  local ok, err = pcall(parallel.waitForAny, listener, broadcaster, input)
+  local ok, err = pcall(parallel.waitForAny, listener, broadcaster, ui)
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
   if not ok and err ~= "Terminated" then error(err, 0) end
 end
 
@@ -637,7 +738,7 @@ end
 
 local M = { wrap180 = wrap180, clamp = clamp, newAxisController = newAxisController, CFG = CFG,
   runSeat = runSeat, runSensor = runSensor, runAxis = runAxis, runControl = runControl,
-  deviceName = deviceName, applyConfig = applyConfig, parseCommand = parseCommand, net = net, VERSION = VERSION }
+  deviceName = deviceName, applyConfig = applyConfig, newPanel = newPanel, net = net, VERSION = VERSION }
 
 local function main(...)
   local args = { ... }

@@ -14,21 +14,29 @@ Every computer needs a wireless (or ender) modem for rednet.
 
 ## The control computer
 
-Put one computer with role `control` anywhere in wireless range. On it you type only the **numbers** of the devices:
+Put one computer with role `control` anywhere in wireless range. It shows a small form (51x19 terminal, works in colour):
 
 ```
-seat 6       -> create_seat_6
-sensor 1     -> sublevel_sensor_1
-yaw 2        -> swivel_bearing_2
-pitch 3      -> swivel_bearing_3
-offset yaw 180      alignment of the horizontal direction, degrees
-calibrate yaw       guns freeze for 15 s; sit in the seat and look along the barrels; the offset is stored
-sign yaw            repeat the "which way does the bearing turn" test
-status              which computers are online, what they see
+TURRET CONTROL  v7
+  Device       Number  Name               State
+> Seat         [6    ] create_seat_6      online
+  Sensor       [1    ] sublevel_sensor_1  online
+  Yaw horiz    [2    ] swivel_bearing_2   online
+  Pitch vert   [3    ] swivel_bearing_3   NO SIGNAL
+
+  Yaw offset   [180  ]  degrees
+  Pitch offs.  [0    ]  degrees
 ```
 
-The numbers are broadcast to all computers and saved there, so they survive restarts. Without a control computer the numbers
-in `CFG.defaultNumbers` (top of `turret.lua`) are used. `turret seat create_seat_9` (a full name) always wins.
+- **Up / Down / Tab** select a row, **digits** type the value (only the device number, not the whole name), **Enter** sends it to every
+  computer (they save it, so it survives restarts), **Backspace** erases. Enter on an empty field sends the numbers again.
+- **Yaw / Pitch offset** rows take degrees (`-` and `.` allowed). `yaw offset 180` = the guns were pointing backwards.
+- **C** calibrates the selected axis: the guns freeze for 15 s, sit in the seat and look exactly along the barrels, the offset is stored.
+- **S** repeats the "which way does the bearing turn" test of the selected axis.
+- The **State** column: `online`, `PROBLEM` (the computer cannot find its device / bearing), `OFFLINE` or `NO SIGNAL`.
+
+Without a control computer the numbers in `CFG.defaultNumbers` (top of `turret.lua`) are used. A full name given on the
+command line (`turret seat create_seat_9`) always wins.
 
 ## Files
 
