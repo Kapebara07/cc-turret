@@ -2,7 +2,7 @@
 --
 -- The guns follow the look direction of the player sitting in a Create seat, with hard angle limits.
 --
---   computer with the seat     :  turret seat   [create_seat_5]
+--   computer with the seat     :  turret seat   [create_seat_6]
 --   computer with the sensor   :  turret sensor [sublevel_sensor_0]
 --   computer with horizontal bearing:  turret yaw   [swivel_bearing_2]
 --   computer with vertical bearing   :  turret pitch [swivel_bearing_3]
@@ -24,7 +24,7 @@
 -- not limited by default (CFG.limits.yaw is empty). The sensor is used to align the guns with the view.
 
 local CFG = {
-  seatName         = "create_seat_5",
+  seatName         = "create_seat_6",
   sensorName       = "sublevel_sensor_0",
   yawBearingName   = "swivel_bearing_2",
   pitchBearingName = "swivel_bearing_3",
@@ -113,7 +113,8 @@ end
 local function runSeat(name)
   local seat, seq = nil, 0
   while true do
-    if not seat then seat = peripheral.wrap(name) end
+    -- the named seat first; if it is gone (renumbered / replaced), any seat this computer can see
+    if not seat then seat = peripheral.wrap(name) or peripheral.find("create_seat") end
     if not seat then
       status("waiting for seat " .. name)
     else
