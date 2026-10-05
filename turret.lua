@@ -42,6 +42,9 @@ local CFG = {
   deadband      = 0.3,   -- degrees; smaller errors are ignored
   maxStep       = 45,    -- biggest correction per cycle, degrees
   pulse         = 12,    -- size of the sign-detection test movement, degrees
+  -- Built-in alignment (degrees) used until an offset is stored by `turret offset ...` or the C key.
+  -- yaw = 180: the guns face the opposite way to the sensor's zero direction, so turn them half a circle.
+  defaultOffset = { yaw = 180, pitch = 0 },
   calibrateDelay = 15,   -- seconds between pressing C and storing the offset
   pitchField    = "pitch", -- which sensor angle is the barrel elevation: "pitch" (or "roll" if the barrels point sideways)
 }
@@ -194,7 +197,7 @@ local function newAxisController(axis, bearingName, cal)
     return (axis == "pitch") and clamp(v, -90, 90) or v
   end
 
-  local function offset() return c.cal[axis .. "Offset"] or 0 end
+  local function offset() return c.cal[axis .. "Offset"] or (CFG.defaultOffset or {})[axis] or 0 end
   local function sign() return c.cal[axis .. "Sign"] or 1 end
 
   -- bearing access, every call protected; a failure drops the handle so it is re-wrapped next cycle

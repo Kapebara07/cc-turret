@@ -16,5 +16,5 @@ It downloads the programs, asks for the role of the computer and sets up `startu
 | `seataim.lua` | Older single-computer variant for a CC:CBC `cannon_mount` instead of swivel bearings. |
 | `install.lua` | The installer/updater. |
 
-**Guns point the wrong way horizontally?** On the `yaw` computer run `turret offset yaw 180` (guns backwards = 180, sideways = 90 or -90).
+**Alignment:** the horizontal offset is 180 degrees by default (`CFG.defaultOffset` in `turret.lua`). If the guns still point the wrong way horizontally, on the `yaw` computer run `turret offset yaw 180` (guns backwards = 180, sideways = 90 or -90).
 Or press `C` on the `yaw` computer: the guns freeze, you have 15 seconds to sit in the seat and look exactly along the barrels, then the offset is stored.
