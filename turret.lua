@@ -11,9 +11,13 @@
 -- Every computer needs a WIRELESS (or ender) modem for rednet, in addition to the modem that sees its peripheral.
 -- Autostart: put  shell.run("turret", "yaw")  (or seat / sensor / pitch)  into startup.lua.
 --
--- First run on a bearing computer: sit in the seat, look EXACTLY along the gun barrels, press C on that computer
--- (this stores the offset between your view and the sensor). The sign (which way the bearing has to turn) is
--- detected automatically with a small test movement the first time the sensor and the bearing are both online.
+-- Aligning the horizontal direction (the guns point 180 degrees wrong / sideways at first):
+--   * quick way:   turret offset yaw 180      (any number of degrees; 180 = the guns pointed backwards)
+--                  turret offset pitch 0
+--   * exact way:   press C on the yaw computer; the guns freeze for 10 seconds - walk to the seat, look EXACTLY along
+--                  the gun barrels, and when the countdown ends the offset is stored.
+-- The sign (which way the bearing has to turn) is detected automatically with a small test movement the first time the
+-- sensor and the bearing are both online.
 --
 -- Limits: the vertical bearing is kept inside CFG.limits.pitch (degrees from the pose it was assembled in). The limit
 -- is enforced every cycle, even when no player sits in the seat or the network is down. The horizontal bearing is
@@ -38,6 +42,7 @@ local CFG = {
   deadband      = 0.3,   -- degrees; smaller errors are ignored
   maxStep       = 45,    -- biggest correction per cycle, degrees
   pulse         = 12,    -- size of the sign-detection test movement, degrees
+  calibrateDelay = 15,   -- seconds between pressing C and storing the offset
   pitchField    = "pitch", -- which sensor angle is the barrel elevation: "pitch" (or "roll" if the barrels point sideways)
 }
 
@@ -241,6 +246,7 @@ local function newAxisController(axis, bearingName, cal)
       return
     end
 
+    if c.hold then return end   -- frozen while a calibration countdown runs
     local want, have = wanted(), measured()
     if want == nil then c.note = "hold (nobody in the seat / no aim data)" return end
     if have == nil then c.note = "hold (no sensor data)" return end
@@ -335,8 +341,14 @@ local function runAxis(axis, bearingName)
     while true do
       local _, ch = os.pullEvent("char")
       if ch == "c" or ch == "C" then
+        c.hold = true            -- freeze the guns so you can see where they really point
+        for i = CFG.calibrateDelay, 1, -1 do
+          c.note = "CALIBRATION in " .. i .. " s: guns frozen, sit in the seat and look along the barrels"
+          sleep(1)
+        end
         local ok, text = c.calibrate()
         c.note = text
+        c.hold = false
       elseif ch == "s" or ch == "S" then
         cal[axis .. "Sign"] = nil     -- the control loop repeats the sign test
         saveCal(cal)
@@ -346,7 +358,12 @@ local function runAxis(axis, bearingName)
 
   local function control()
     local nextSignTry = 0
+    local cycles = 0
     while true do
+      cycles = cycles + 1
+      if cycles % 10 == 0 then   -- pick up changes made by `turret offset ...`
+        for k, v in pairs(loadCal()) do cal[k] = v end
+      end
       if cal[axis .. "Sign"] == nil and c.engaged and c.now() >= nextSignTry then
         local ok, text = c.detectSign(8)
         c.note = text
@@ -374,19 +391,32 @@ end
 
 local M = { wrap180 = wrap180, clamp = clamp, newAxisController = newAxisController, CFG = CFG,
   runSeat = runSeat, runSensor = runSensor, runAxis = runAxis }
+M.main = nil   -- filled in below
 
 local function main(...)
   local args = { ... }
   local role = args[1]
+  if role == "offset" then
+    local axis, value = args[2], tonumber(args[3])
+    if (axis ~= "yaw" and axis ~= "pitch") or value == nil then
+      print("usage: turret offset yaw|pitch <degrees>   e.g.  turret offset yaw 180")
+      return
+    end
+    local cal = loadCal()
+    cal[axis .. "Offset"] = value
+    saveCal(cal)
+    print(axis .. " offset set to " .. value .. " (a running turret picks it up within a second)")
+    return
+  end
   if role ~= "seat" and role ~= "sensor" and role ~= "yaw" and role ~= "pitch" then
-    print("usage: turret seat|sensor|yaw|pitch [peripheral name]")
+    print("usage: turret seat|sensor|yaw|pitch [peripheral name]   or   turret offset yaw|pitch <degrees>")
     return
   end
   if not openRednet() then error("No modem found: attach a wireless (or ender) modem", 0) end
   term.clear()
   term.setCursorPos(1, 1)
   print("turret " .. role .. "   (Ctrl+T to stop)")
-  if role == "yaw" or role == "pitch" then print("C = calibrate (look along the barrels), S = redo sign test") end
+  if role == "yaw" or role == "pitch" then print("C = calibrate in " .. CFG.calibrateDelay .. " s (look along the barrels), S = redo sign test") end
   print("")
   local _, row = term.getCursorPos()
   statusRow = row
@@ -396,5 +426,6 @@ local function main(...)
   else runAxis("pitch", args[2] or CFG.pitchBearingName) end
 end
 
+M.main = main
 if _G.TURRET_TESTING then return M end
 main(...)
