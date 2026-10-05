@@ -17,6 +17,7 @@
 --   Yaw offset / Pitch offset rows: alignment in degrees (yaw offset 180 = the guns were pointing backwards)
 --   C = calibrate the selected axis (guns freeze for 15 s, sit in the seat and look along the barrels)
 --   S = repeat the "which way does the bearing turn" test of the selected axis
+--   I = mirror switch of the selected axis: use it when the guns move opposite to your head (up = down)
 -- The state column shows which computers are online. The numbers are saved on every computer, so they survive restarts.
 -- Without a control computer the numbers in CFG.defaultNumbers are used (or `turret seat create_seat_6`, a full name
 -- as the second argument always wins).
@@ -51,7 +52,7 @@ local CFG = {
   offlineAfter  = 5,     -- the control computer calls a silent computer offline after this many seconds
 }
 
-local VERSION = "7 (2026-10-05)"
+local VERSION = "8 (2026-10-05)"
 local PROTOCOL = "turret.v1"
 local CAL_FILE = "turret_cal.txt"
 local NET_FILE = "turret_net.txt"
@@ -288,6 +289,13 @@ local function newAxisController(axis, bearingName, cal)
       c.note = "offset set to " .. msg.value
     elseif msg.cmd == "calibrate" then
       c.wantCalibrate = true
+    elseif msg.cmd == "invert" then
+      local now = (c.cal[axis .. "Invert"] or 0) ~= 0
+      local want
+      if msg.value == nil then want = not now else want = (msg.value == true or (isNumber(msg.value) and msg.value ~= 0)) end
+      c.cal[axis .. "Invert"] = want and 1 or 0
+      saveCal(c.cal)
+      c.note = want and "mirror: ON" or "mirror: off"
     elseif msg.cmd == "sign" then
       c.cal[axis .. "Sign"] = nil     -- the control loop repeats the sign test
       saveCal(c.cal)
@@ -303,12 +311,19 @@ local function newAxisController(axis, bearingName, cal)
     return isNumber(v) and v or nil
   end
 
+  -- Mirror switch: with it on, looking up makes the guns go down and the other way round (and left/right for yaw).
+  -- Needed when the sensor or the bearing is mounted so that the guns move opposite to the view.
+  local function inverted() return (c.cal[axis .. "Invert"] or 0) ~= 0 end
+  c.isInverted = inverted
+
   local function wanted()
     local a = c.aim
     if not (a and a.occ and fresh(c.aimAt)) then return nil end
     local v = (axis == "yaw") and a.yaw or a.pitch
     if not isNumber(v) then return nil end
-    return (axis == "pitch") and clamp(v, -90, 90) or v
+    if axis == "pitch" then v = clamp(v, -90, 90) end
+    if inverted() then v = -v end
+    return v
   end
 
   local function offset() return c.cal[axis .. "Offset"] or (CFG.defaultOffset or {})[axis] or 0 end
@@ -465,7 +480,7 @@ local function runAxis(axis, explicit)
   local c = newAxisController(axis, function() return deviceName(axis, explicit) end, cal)
   c.onTick = function()
     status(axis .. ": " .. tostring(c.note))
-    announce(axis, c.name, c.engaged and true or false, tostring(c.note), { offset = c.getOffset(), sign = c.getSign() })
+    announce(axis, c.name, c.engaged and true or false, tostring(c.note), { offset = c.getOffset(), sign = c.getSign(), invert = c.isInverted() and 1 or 0 })
   end
 
   local function receiver()
@@ -483,6 +498,8 @@ local function runAxis(axis, explicit)
         c.wantCalibrate = true
       elseif ch == "s" or ch == "S" then
         c.onCommand({ cmd = "sign" })
+      elseif ch == "i" or ch == "I" then
+        c.onCommand({ cmd = "invert" })
       end
     end
   end
@@ -506,7 +523,7 @@ local function runAxis(axis, explicit)
       end
       c.step()
       status(axis .. ": " .. tostring(c.note))
-      announce(axis, c.name, c.engaged and true or false, tostring(c.note), { offset = c.getOffset(), sign = c.getSign() })
+      announce(axis, c.name, c.engaged and true or false, tostring(c.note), { offset = c.getOffset(), sign = c.getSign(), invert = c.isInverted() and 1 or 0 })
       sleep(CFG.controlPeriod)
     end
   end
@@ -591,10 +608,15 @@ local function newPanel(deps)
       local ch = a:lower()
       if allowedChar(row, ch) then
         if #p.buf < maxLen(row) then p.buf = p.buf .. ch end
-      elseif ch == "c" or ch == "s" then
+      elseif ch == "c" or ch == "s" or ch == "i" then
         local axis = axisOfRow(row)
         if not axis then say("select a Yaw or Pitch row first", true) return end
-        if ch == "c" then
+        if ch == "i" then
+          local st = deps.seen(axis)
+          local nowOn = st and st.invert == 1
+          deps.sendCmd(axis, "invert", nowOn and 0 or 1)
+          say(axis .. ": mirror " .. (nowOn and "OFF" or "ON") .. " (looking up " .. (nowOn and "= guns up" or "= guns down on this axis") .. ")")
+        elseif ch == "c" then
           deps.sendCmd(axis, "calibrate")
           say(axis .. ": guns freeze " .. CFG.calibrateDelay .. " s - sit in the seat and look along the barrels")
         else
@@ -650,13 +672,15 @@ local function newPanel(deps)
         paint(stc)
         term.write(st)
       else
-        line(y, text .. ((selected and p.buf ~= "") and "  Enter = send" or "  degrees"), selected and colors.white or colors.lightGray)
+        local inv = deps.seen(row.axis)
+        local mirror = (inv and inv.invert == 1) and "mirror ON " or ((inv and inv.invert == 0) and "mirror off" or "mirror ?  ")
+        line(y, text .. ((selected and p.buf ~= "") and "  Enter = send" or ("  deg   " .. mirror)), selected and colors.white or colors.lightGray)
       end
       y = y + 1
     end
     if os.clock() - p.msgAt <= 8 then line(y + 1, p.msg, p.msgBad and colors.red or colors.lime) end
     line(h - 3, "Up/Down: row   0-9: type   Enter: send", colors.gray)
-    line(h - 2, "Backspace: erase   C: calibrate   S: direction test", colors.gray)
+    line(h - 2, "C: calibrate   S: direction test   I: mirror", colors.gray)
     line(h - 1, "Yaw offset 180 = guns were pointing backwards", colors.gray)
     paint(colors.white)
   end
@@ -695,7 +719,7 @@ local function runControl()
     while true do
       local _, msg = rednet.receive(PROTOCOL)
       if type(msg) == "table" and msg.t == "status" and PREFIX[msg.role or ""] then
-        seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note, offset = msg.offset, sign = msg.sign }
+        seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note, offset = msg.offset, sign = msg.sign, invert = msg.invert }
       end
     end
   end

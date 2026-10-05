@@ -17,15 +17,15 @@ Every computer needs a wireless (or ender) modem for rednet.
 Put one computer with role `control` anywhere in wireless range. It shows a small form (51x19 terminal, works in colour):
 
 ```
-TURRET CONTROL  v7
+TURRET CONTROL  v8
   Device       Number  Name               State
 > Seat         [6    ] create_seat_6      online
   Sensor       [1    ] sublevel_sensor_1  online
   Yaw horiz    [2    ] swivel_bearing_2   online
   Pitch vert   [3    ] swivel_bearing_3   NO SIGNAL
 
-  Yaw offset   [180  ]  degrees
-  Pitch offs.  [0    ]  degrees
+  Yaw offset   [180  ]  deg   mirror off
+  Pitch offs.  [0    ]  deg   mirror ON
 ```
 
 - **Up / Down / Tab** select a row, **digits** type the value (only the device number, not the whole name), **Enter** sends it to every
@@ -33,6 +33,7 @@ TURRET CONTROL  v7
 - **Yaw / Pitch offset** rows take degrees (`-` and `.` allowed). `yaw offset 180` = the guns were pointing backwards.
 - **C** calibrates the selected axis: the guns freeze for 15 s, sit in the seat and look exactly along the barrels, the offset is stored.
 - **S** repeats the "which way does the bearing turn" test of the selected axis.
+- **I** is the **mirror switch** of the selected axis: if the guns move opposite to your head (you look up, they go down), press it. It works for both the vertical and the horizontal axis; the offset rows show `mirror ON` / `mirror off`.
 - The **State** column: `online`, `PROBLEM` (the computer cannot find its device / bearing), `OFFLINE` or `NO SIGNAL`.
 
 Without a control computer the numbers in `CFG.defaultNumbers` (top of `turret.lua`) are used. A full name given on the
