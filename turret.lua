@@ -49,6 +49,7 @@ local CFG = {
   pitchField    = "pitch", -- which sensor angle is the barrel elevation: "pitch" (or "roll" if the barrels point sideways)
 }
 
+local VERSION = "5 (2026-10-05)"
 local PROTOCOL = "turret.v1"
 local CAL_FILE = "turret_cal.txt"
 
@@ -426,7 +427,10 @@ local function main(...)
   if not openRednet() then error("No modem found: attach a wireless (or ender) modem", 0) end
   term.clear()
   term.setCursorPos(1, 1)
-  print("turret " .. role .. "   (Ctrl+T to stop)")
+  local shown = args[2] or (role == "seat" and CFG.seatName) or (role == "sensor" and CFG.sensorName)
+    or (role == "yaw" and CFG.yawBearingName) or CFG.pitchBearingName
+  print("turret v" .. VERSION .. "  role: " .. role .. "  device: " .. shown)
+  print("(Ctrl+T to stop)")
   if role == "yaw" or role == "pitch" then print("C = calibrate in " .. CFG.calibrateDelay .. " s (look along the barrels), S = redo sign test") end
   print("")
   local _, row = term.getCursorPos()
