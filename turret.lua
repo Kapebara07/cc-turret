@@ -2,6 +2,7 @@
 --
 -- The guns follow the look direction of the player sitting in a Create seat, with hard angle limits.
 --
+--   turret auto        RECOMMENDED on every device computer: the role is found from the devices it sees
 --   turret control     the CONTROL computer: a form where you type only numbers; it tells the other computers which devices to use
 --   turret seat        computer with the seat
 --   turret sensor      computer with the sensor on the gun structure
@@ -52,7 +53,7 @@ local CFG = {
   offlineAfter  = 5,     -- the control computer calls a silent computer offline after this many seconds
 }
 
-local VERSION = "9 (2026-10-05)"
+local VERSION = "10 (2026-10-05)"
 local PROTOCOL = "turret.v1"
 local CAL_FILE = "turret_cal.txt"
 local NET_FILE = "turret_net.txt"
@@ -179,7 +180,7 @@ local function announce(role, device, ok, note, extra)
   local now = os.clock()
   if lastAnnounce[role] and now - lastAnnounce[role] < CFG.statusPeriod then return end
   lastAnnounce[role] = now
-  local m = { t = "status", role = role, device = device, ok = ok and true or false, note = note }
+  local m = { t = "status", role = role, device = device, ok = ok and true or false, note = note, ver = VERSION }
   if extra then for k, v in pairs(extra) do m[k] = v end end
   rednet.broadcast(m, PROTOCOL)
 end
@@ -603,6 +604,12 @@ local function newPanel(deps)
     if v == nil then say("'" .. p.buf .. "' is not a number", true) p.buf = "" return end
     if row.kind == "num" then
       if v < 0 or v > 999 or v % 1 ~= 0 then say("device number must be a whole number 0-999", true) p.buf = "" return end
+      local other = (row.role == "yaw") and "pitch" or ((row.role == "pitch") and "yaw" or nil)
+      if other and deps.number(other) == v then
+        say("yaw and pitch need two different bearings (" .. other .. " is " .. v .. " already)", true)
+        p.buf = ""
+        return
+      end
       deps.setNumber(row.role, v)
       say(row.role .. " -> " .. deps.deviceName(row.role) .. "   (sent)")
     else
@@ -700,7 +707,15 @@ local function newPanel(deps)
     local rowNow = ROWS[p.sel]
     local selRole = axisOfRow(rowNow) or rowNow.role
     local sn = selRole and deps.seen(selRole)
-    if sn and sn.note then line(y + 3, string.sub(selRole .. ": " .. tostring(sn.note), 1, w), colors.gray) end
+    if sn and sn.note then
+      line(y + 3, string.sub(selRole .. ": " .. tostring(sn.note) .. (sn.ver and ("  [v" .. tostring(sn.ver):match("^%S+") .. "]") or "  [old version]"), 1, w), colors.gray)
+    end
+    local lost = deps.unassigned and deps.unassigned()
+    if lost then
+      line(y + 4, lost, colors.orange)
+    elseif not (deps.seen("seat") or deps.seen("sensor") or deps.seen("yaw") or deps.seen("pitch")) then
+      line(y + 4, "Nobody reports: update the other computers (v" .. VERSION:match("^%S+") .. ") and check wireless modems", colors.orange)
+    end
     line(h - 3, "Up/Down: row   0-9: type   Enter: send", colors.gray)
     line(h - 2, "C: calibrate   S: direction test   I: mirror", colors.gray)
     line(h - 1, "Yaw offset 180 = guns were pointing backwards", colors.gray)
@@ -715,6 +730,7 @@ local function runControl()
   local seen = {}                       -- role -> { at=, device=, ok=, note=, offset=, sign= }
   local netRev = 0
 
+  local lonely = {}                     -- sender id -> { at=, sees= }  (computers that see none of the 4 devices)
   local conflict = nil                  -- another control computer sends different numbers
   local adopted = nil                   -- we took newer numbers from another control computer
 
@@ -732,6 +748,18 @@ local function runControl()
   end
 
   local panel = newPanel({
+    unassigned = function()
+      local count, first = 0, nil
+      for id, l in pairs(lonely) do
+        if os.clock() - l.at <= 6 then
+          count = count + 1
+          first = first or { id = id, sees = l.sees }
+        end
+      end
+      if count == 0 then return nil end
+      local sees = (first.sees and #first.sees > 0) and table.concat(first.sees, ",") or "nothing"
+      return count .. " computer(s) see none of the 4 devices; #" .. tostring(first.id) .. " sees: " .. sees
+    end,
     conflict = function()
       if conflict and os.clock() - conflict.at <= 10 then
         return "! computer #" .. tostring(conflict.id) .. " also sends numbers (older/different) - turn it off"
@@ -759,8 +787,11 @@ local function runControl()
   local function listener()
     while true do
       local sender, msg = rednet.receive(PROTOCOL)
-      if type(msg) == "table" and msg.t == "status" and PREFIX[msg.role or ""] then
-        seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note, offset = msg.offset, sign = msg.sign, invert = msg.invert }
+      if type(msg) == "table" and msg.t == "status" and msg.role == "none" then
+        lonely[sender] = { at = os.clock(), sees = msg.sees }
+      elseif type(msg) == "table" and msg.t == "status" and PREFIX[msg.role or ""] then
+        seen[msg.role] = { at = os.clock(), device = msg.device, ok = msg.ok, note = msg.note, offset = msg.offset, sign = msg.sign, invert = msg.invert, ver = msg.ver }
+        lonely[sender] = nil
       elseif type(msg) == "table" and msg.t == "config" then
         if isNumber(msg.stamp) and msg.stamp > 0 and applyConfig(msg, sender) then
           adopted = { id = sender, at = os.clock() }     -- it had newer settings: we follow it
@@ -810,10 +841,75 @@ local function runControl()
   if not ok and err ~= "Terminated" then error(err, 0) end
 end
 
+------------------------------------------------------------------------------------------------ automatic role
+
+-- The roles whose configured device this computer can see right now.
+local function visibleRoles()
+  local list = {}
+  for _, role in ipairs(ROLE_ORDER) do
+    if peripheral.wrap(deviceName(role)) then list[#list + 1] = role end
+  end
+  return list
+end
+
+local function sameList(a, b)
+  if #a ~= #b then return false end
+  for i = 1, #a do if a[i] ~= b[i] then return false end end
+  return true
+end
+
+-- Names of the non-modem peripherals this computer sees (a few, for the control computer's hint).
+local function localSees()
+  local out = {}
+  for _, n in ipairs(peripheral.getNames()) do
+    if peripheral.getType(n) ~= "modem" and #out < 5 then out[#out + 1] = n end
+  end
+  return out
+end
+
+-- `turret auto`: no role to choose. The computer looks at the devices it sees and takes the matching role(s):
+-- create_seat_<seat number> -> seat, sublevel_sensor_<sensor number> -> sensor, swivel_bearing_<yaw number> -> yaw,
+-- swivel_bearing_<pitch number> -> pitch. A wrong role is impossible; numbers changed on the control computer
+-- move the role at once.
+local function runAuto()
+  local runners = {
+    seat   = function() runSeat() end,
+    sensor = function() runSensor() end,
+    yaw    = function() runAxis("yaw") end,
+    pitch  = function() runAxis("pitch") end,
+  }
+  while true do
+    local roles = visibleRoles()
+    if #roles == 0 then
+      -- nothing to do yet: keep listening for numbers and tell the control computer what we see
+      withConfigListener(function()
+        while true do
+          local sees = localSees()
+          status("sees none of: " .. deviceName("seat") .. " " .. deviceName("sensor") .. " " .. deviceName("yaw") .. " " .. deviceName("pitch"))
+          rednet.broadcast({ t = "status", role = "none", ok = false, sees = sees, ver = VERSION }, PROTOCOL)
+          sleep(2)
+          if #visibleRoles() > 0 then return end
+        end
+      end)
+    else
+      local fns = {}
+      for _, r in ipairs(roles) do fns[#fns + 1] = runners[r] end
+      local function watcher()
+        while true do
+          sleep(3)
+          if not sameList(visibleRoles(), roles) then return end    -- numbers or devices changed: pick the roles again
+        end
+      end
+      parallel.waitForAny(watcher, table.unpack(fns))
+    end
+  end
+end
+
 ------------------------------------------------------------------------------------------------ main
 
 local M = { wrap180 = wrap180, clamp = clamp, newAxisController = newAxisController, CFG = CFG,
-  runSeat = runSeat, runSensor = runSensor, runAxis = runAxis, runControl = runControl,
+  runSeat = runSeat, runSensor = runSensor, runAxis = runAxis, runControl = runControl, runAuto = runAuto,
+  visibleRoles = visibleRoles,
   deviceName = deviceName, applyConfig = applyConfig, newPanel = newPanel, net = net, VERSION = VERSION }
 
 local function main(...)
@@ -831,8 +927,8 @@ local function main(...)
     print(axis .. " offset set to " .. value .. " (a running turret picks it up within a second)")
     return
   end
-  if role ~= "seat" and role ~= "sensor" and role ~= "yaw" and role ~= "pitch" and role ~= "control" then
-    print("usage: turret control | seat | sensor | yaw | pitch  [full peripheral name]")
+  if role ~= "seat" and role ~= "sensor" and role ~= "yaw" and role ~= "pitch" and role ~= "control" and role ~= "auto" then
+    print("usage: turret auto | control   (or seat | sensor | yaw | pitch  [full peripheral name])")
     return
   end
   if not openRednet() then error("No modem found: attach a wireless (or ender) modem", 0) end
@@ -841,6 +937,16 @@ local function main(...)
   if role == "control" then
     print("turret v" .. VERSION .. "  CONTROL computer")
     runControl()
+    return
+  end
+  if role == "auto" then
+    print("turret v" .. VERSION .. "  AUTO role")
+    print("(the role comes from the devices this computer sees; Ctrl+T to stop)")
+    print("C = calibrate, S = redo sign test, I = mirror (bearing computers)")
+    print("")
+    local _, arow = term.getCursorPos()
+    statusRow = arow
+    runAuto()
     return
   end
   local shown = deviceName(role, args[2])

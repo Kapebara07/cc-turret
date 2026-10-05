@@ -8,16 +8,18 @@ ComputerCraft programs for aiming Create guns with the look direction of the pla
 wget run https://raw.githubusercontent.com/Kapebara07/cc-turret/main/install.lua
 ```
 
-It downloads the programs, asks for the role of the computer and sets up `startup.lua`.
-Roles: `control`, `seat`, `sensor`, `yaw` (horizontal swivel bearing), `pitch` (vertical swivel bearing).
-Every computer needs a wireless (or ender) modem for rednet.
+It downloads the programs and sets up `startup.lua`. On every computer that touches a device just press **Enter** (role `auto`):
+the computer finds its role from the devices it sees - `create_seat_<n>` is the seat, `sublevel_sensor_<n>` the sensor,
+`swivel_bearing_<n>` the horizontal (yaw) or vertical (pitch) bearing, depending on the numbers you set. A wrong role is impossible,
+and a computer that sees none of the configured devices reports what it does see to the control computer.
+Type `control` on the one computer where you enter the numbers. Every computer needs a wireless (or ender) modem for rednet.
 
 ## The control computer
 
 Put one computer with role `control` anywhere in wireless range. It shows a small form (51x19 terminal, works in colour):
 
 ```
-TURRET CONTROL  v9
+TURRET CONTROL  v10
   Device       Number  Name               State
 > Seat         [6    ] create_seat_6      online
   Sensor       [1    ] sublevel_sensor_1  online

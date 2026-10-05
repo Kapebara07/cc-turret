@@ -2,13 +2,14 @@
 --
 --   wget run https://raw.githubusercontent.com/Kapebara07/cc-turret/main/install.lua
 --
--- It downloads the latest turret.lua and seataim.lua, asks which role this computer has
--- (control / seat / sensor / yaw / pitch) and writes startup.lua so the program starts by itself.
+-- It downloads the latest turret.lua and seataim.lua and writes startup.lua so the program starts by itself.
+-- Role: just press Enter for "auto" - the computer finds its role from the devices it sees (seat, sensor, yaw
+-- bearing, pitch bearing). Type "control" only on the one computer where you enter the device numbers.
 -- Run the same command again any time to update.
 
 local BASE = "https://raw.githubusercontent.com/Kapebara07/cc-turret/main/"
 local FILES = { "turret.lua", "seataim.lua" }
-local ROLES = { control = true, seat = true, sensor = true, yaw = true, pitch = true }
+local ROLES = { auto = true, control = true, seat = true, sensor = true, yaw = true, pitch = true }
 
 if not http then error("HTTP is disabled in the ComputerCraft config", 0) end
 
@@ -45,10 +46,10 @@ end
 -- role + startup.lua
 local role = ...
 while not ROLES[role or ""] do
-  write("Role of this computer (control / seat / sensor / yaw / pitch, empty = do not set up startup): ")
-  role = read()
-  if role == "" then role = nil break end
-  role = role:lower()
+  write("Role (Enter = auto, recommended; control = the number-entry computer; none = no startup): ")
+  role = read():lower()
+  if role == "" then role = "auto" end
+  if role == "none" then role = nil break end
 end
 
 if role then
@@ -71,5 +72,5 @@ if role then
   sleep(1)
   shell.run("turret", role)
 else
-  print("Installed. Run:  turret control | seat | sensor | yaw | pitch")
+  print("Installed. Run:  turret auto   (or turret control)")
 end
